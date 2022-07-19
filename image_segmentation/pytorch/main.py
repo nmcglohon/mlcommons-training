@@ -16,12 +16,16 @@ from runtime.distributed_utils import seed_everything, setup_seeds
 from runtime.logging import get_dllogger, mllog_start, mllog_end, mllog_event, mlperf_submission_log, mlperf_run_param_log
 from runtime.callbacks import get_callbacks
 
+from torch.utils.tensorboard import SummaryWriter
+
 DATASET_SIZE = 168
 
 
 def main():
-    mllog.config(filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'unet3d.log'))
-    mllog.config(filename=os.path.join("/results", 'unet3d.log'))
+    job_config = os.environ.get("JOB_CONFIG")
+
+    mllog.config(filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), f'unet3d-{job_config}.log'))
+#    mllog.config(filename=os.path.join("/results", 'unet3d.log'))
     mllogger = mllog.get_mllogger()
     mllogger.logger.propagate = False
     mllog_start(key=constants.INIT_START)
@@ -36,7 +40,13 @@ def main():
     worker_seeds, shuffling_seeds = setup_seeds(flags.seed, flags.epochs, device)
     worker_seed = worker_seeds[local_rank]
     seed_everything(worker_seed)
+    print(f"Is Distributed: {is_distributed}; World Size: {world_size}; Local Rank: {local_rank}")
     mllog_event(key=constants.SEED, value=flags.seed if flags.seed != -1 else worker_seed, sync=False)
+
+    print(f"Writing TB to runs/{flags.run_name}")
+    writer = SummaryWriter(f"runs/{flags.run_name}")
+
+    print(f"Using AMP? {flags.amp}")
 
     if is_main_process:
         mlperf_submission_log()
@@ -63,7 +73,7 @@ def main():
 
     if flags.exec_mode == 'train':
         train(flags, model, train_dataloader, val_dataloader, loss_fn, score_fn,
-              device=device, callbacks=callbacks, is_distributed=is_distributed)
+              device=device, callbacks=callbacks, is_distributed=is_distributed, writer=writer)
 
     elif flags.exec_mode == 'evaluate':
         eval_metrics = evaluate(flags, model, val_dataloader, loss_fn, score_fn,
@@ -74,7 +84,6 @@ def main():
     else:
         print("Invalid exec_mode.")
         pass
-
 
 if __name__ == '__main__':
     main()

@@ -7,12 +7,12 @@ from torch.cuda.amp import autocast, GradScaler
 from runtime.distributed_utils import get_rank, reduce_tensor, get_world_size
 from runtime.inference import evaluate
 from runtime.logging import mllog_event, mllog_start, mllog_end, CONSTANTS
-
+from torch.distributed.optim import ZeroRedundancyOptimizer
 
 def get_optimizer(params, flags):
     if flags.optimizer == "adam":
         optim = Adam(params, lr=flags.learning_rate, weight_decay=flags.weight_decay)
-    elif flags.optimizer == "sgd":
+    elif flags.optimizer == "sgd": #with nesterov==True, this is NAG
         optim = SGD(params, lr=flags.learning_rate, momentum=flags.momentum, nesterov=True,
                     weight_decay=flags.weight_decay)
     elif flags.optimizer == "lamb":
@@ -23,6 +23,14 @@ def get_optimizer(params, flags):
         raise ValueError("Optimizer {} unknown.".format(flags.optimizer))
     return optim
 
+def get_optimizer_zero(params, flags):
+    if flags.optimizer == "adam":
+        optim = ZeroRedundancyOptimizer(model.parameters(), Adam, lr=flags.learning_rate, weight_decay=flags.weight_decay)
+    elif flags.optimizer == "sgd": #with nesterov==True, this is NAG
+        optim = ZeroRedundancyOptimizer(model.parameters(), SGD, lr=flags.learning_rate, momentum=flags.momentum, weight_decay=flags.weight_decay, nestrov=True)
+    else:
+        raise ValueError("Optimizer {} unknown.".format(flags.optimizer))
+    return optim
 
 def lr_warmup(optimizer, init_lr, lr, current_epoch, warmup_epochs):
     scale = current_epoch / warmup_epochs
@@ -30,17 +38,12 @@ def lr_warmup(optimizer, init_lr, lr, current_epoch, warmup_epochs):
         param_group['lr'] = init_lr + (lr - init_lr) * scale
 
 
-def train(flags, model, train_loader, val_loader, loss_fn, score_fn, device, callbacks, is_distributed):
+def train(flags, model, train_loader, val_loader, loss_fn, score_fn, device, callbacks, is_distributed, writer=None):
     rank = get_rank()
     world_size = get_world_size()
     torch.backends.cudnn.benchmark = flags.cudnn_benchmark
     torch.backends.cudnn.deterministic = flags.cudnn_deterministic
 
-    optimizer = get_optimizer(model.parameters(), flags)
-    if flags.lr_decay_epochs:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                         milestones=flags.lr_decay_epochs,
-                                                         gamma=flags.lr_decay_factor)
     scaler = GradScaler()
 
     model.to(device)
@@ -49,6 +52,15 @@ def train(flags, model, train_loader, val_loader, loss_fn, score_fn, device, cal
         model = torch.nn.parallel.DistributedDataParallel(model,
                                                           device_ids=[flags.local_rank],
                                                           output_device=flags.local_rank)
+    if flags.use_zero:
+        optimizer = get_optimizer_zero(model.parameters(), flags)
+    else:
+        optimizer = get_optimizer(model.parameters(), flags)
+
+    if flags.lr_decay_epochs:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                         milestones=flags.lr_decay_epochs,
+                                                         gamma=flags.lr_decay_factor)
 
     is_successful = False
     diverged = False
@@ -117,14 +129,21 @@ def train(flags, model, train_loader, val_loader, loss_fn, score_fn, device, cal
                         sync=False)
             mllog_end(key=CONSTANTS.EVAL_STOP, metadata={CONSTANTS.EPOCH_NUM: epoch}, sync=False)
 
+            if flags.use_tensorboard == 1 and rank == 0:
+                writer.add_scalar("DICE/l1_dice", eval_metrics["L1 dice"], epoch)
+                writer.add_scalar("DICE/l2_dice", eval_metrics["L2 dice"], epoch)
+                writer.add_scalar("DICE/mean_dice", eval_metrics["mean_dice"], epoch)
+                writer.add_scalar("Loss/eval_loss", eval_metrics["eval_loss"], epoch)
+                writer.add_scalar("Loss/train_loss", eval_metrics["train_loss"],epoch)
+
             for callback in callbacks:
                 callback.on_epoch_end(epoch=epoch, metrics=eval_metrics, model=model, optimizer=optimizer)
             model.train()
             if eval_metrics["mean_dice"] >= flags.quality_threshold:
                 is_successful = True
-            elif eval_metrics["mean_dice"] < 1e-6:
-                print("MODEL DIVERGED. ABORTING.")
-                diverged = True
+            # elif eval_metrics["mean_dice"] < 1e-6:
+            #     print("MODEL DIVERGED. ABORTING.")
+            #     diverged = True
 
         mllog_end(key=CONSTANTS.BLOCK_STOP, sync=False,
                   metadata={CONSTANTS.FIRST_EPOCH_NUM: epoch, CONSTANTS.EPOCH_COUNT: 1})
